@@ -75,28 +75,29 @@ const CALL_TIMEOUT_MS = 30000;
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
-/**
- * The per-trial budget this router plans for each provider: the most calls it will send there before it
- * prefers another candidate. The brief never publishes a provider's drawn budget, so this is a plan, not
- * knowledge: a provider that refuses calls it cannot take is failed over and set aside, and the trial
- * goes on. The numbers are deliberately a little above the floor a free tier implies: enough to use a
- * strong provider for the heavy requests, never so much that the plan leans on capacity that may not be
- * there. A provider missing from the table gets a plan of its own from the default.
- */
-const BUDGET_PLAN: Readonly<Record<string, number>> = {
-  groq: 12,
-  cerebras: 6,
-  gemini: 8,
-  zai: 5,
-  openrouter: 12,
-  sambanova: 5,
-  pollinations: 14,
-  cloudflare: 8,
-  ovh: 6,
-  kilol: 16,
+/** Per-provider free-tier budget bounds [min, max] from the provider spec, with a general fallback. */
+const CALL_BOUNDS: Readonly<Record<string, readonly [number, number]>> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
 };
-/** The planned budget for a provider the table does not name. */
-const DEFAULT_BUDGET = 20;
+const DEFAULT_BOUNDS: readonly [number, number] = [8, 12];
+
+type Outcome = 'ok' | 'tr' | 'spent' | 'out';
+interface Hypothesis {
+  budget: number;
+  fails: Set<number>;
+  outage: number | null;
+  isSec: boolean;
+  baseW: number;
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -142,7 +143,6 @@ interface Route {
   row: RatingRow | null;
   wire: Wire;
   rating: number;
-  budget: number;
 }
 
 /** Every free route across the providers that answered, with its capabilities and rating. */
@@ -159,7 +159,6 @@ function allRoutes(): Route[] {
         row,
         wire: probe.provider.wire === 'anthropic' ? 'anthropic' : probe.provider.wire === 'gemini' ? 'gemini' : 'openai',
         rating: row !== null ? row.rating_milli : 0,
-        budget: BUDGET_PLAN[probe.provider.id] ?? DEFAULT_BUDGET,
       });
     }
   }
@@ -171,64 +170,156 @@ function carriesJsonMode(wire: Wire): boolean {
   return wire !== 'anthropic';
 }
 
-/** The free routes that meet the requirements, best rating first: headroom, then ids, break the ties. */
-function candidatesFor(
-  routes: readonly Route[],
-  requires: Requirement,
-  needsJsonWire: boolean,
-): Route[] {
-  const eligible = routes.filter(
-    (route) =>
-      carriesJsonMode(route.wire) || !needsJsonWire,
-  );
-  const out = eligible.filter((route) => meetsRequirements(requires, capabilitiesOf(route.model, route.row)));
-  const headroom = (route: Route): number => route.budget - (planUsage.get(route.provider.id) ?? 0);
-  return out.sort((a, b) => {
-    if (a.rating !== b.rating) return b.rating - a.rating;
-    const ha = headroom(a);
-    const hb = headroom(b);
-    if (ha !== hb) return hb - ha;
-    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
-  });
+function buildHypotheses(lo: number, hi: number): Hypothesis[] {
+  const out: Hypothesis[] = [];
+  for (let b = lo; b <= hi; b++) {
+    const pB = 1 / (hi - lo + 1);
+    const slots: number[] = [];
+    for (let s = 2; s <= b - 1; s++) slots.push(s);
+    const failSets: { set: number[]; p: number }[] = slots.map((s) => ({ set: [s], p: slots.length >= 2 ? 0.5 / slots.length : 1 / Math.max(1, slots.length) }));
+    if (slots.length >= 2) {
+      const pairs = (slots.length * (slots.length - 1)) / 2;
+      for (let i = 0; i < slots.length; i++) {
+        for (let j = i + 1; j < slots.length; j++) {
+          failSets.push({ set: [slots[i]!, slots[j]!], p: 0.5 / pairs });
+        }
+      }
+    }
+    for (const fs of failSets) {
+      for (const isSec of [false, true]) {
+        const eff = isSec && !fs.set.includes(2) ? [2, ...fs.set.slice(1)] : fs.set;
+        const fails = new Set<number>(eff);
+        out.push({ budget: b, fails, outage: null, isSec, baseW: pB * fs.p });
+        for (const o of slots) out.push({ budget: b, fails, outage: o, isSec, baseW: (pB * fs.p) / slots.length });
+      }
+    }
+  }
+  return out;
 }
 
-/** The plan's per-provider call count while assigning; the runtime counts its own. */
-const planUsage = new Map<string, number>();
-/** Each manifest request's planned route, by request id. */
-const plan = new Map<string, Route>();
+const hypothesesByProvider = new Map<string, Hypothesis[]>();
+const probMemo = new Map<string, number>();
+const bestByReq = new Map<string, number>();
+let remSafe: number[] = [0];
+let totalBound = 0;
+let targetEarned = 0;
+let activeProviderCount = 10;
 
-/**
- * Assign the manifest's requests to routes before the first one arrives: the heaviest requests first,
- * each to the best-rated candidate that meets it while the plan still has budget there. The plan is a
- * preference, not a commitment: at runtime a provider that refuses is failed over and the trial goes on.
- */
-function planWorkload(routes: readonly Route[]): void {
+const history = new Map<string, Outcome[]>();
+const consecutiveRefusals = new Map<string, number>();
+const setAside = new Set<string>();
+let outageProvider: string | null = null;
+let k2OkCount = 0;
+let k2FailSeen = false;
+let earnedSoFar = 0;
+
+function initRouter(routes: readonly Route[]): void {
+  const providerIds = new Set(routes.map((r) => r.provider.id));
+  activeProviderCount = Math.max(2, providerIds.size);
+  for (const id of providerIds) {
+    const [lo, hi] = CALL_BOUNDS[id] ?? DEFAULT_BOUNDS;
+    hypothesesByProvider.set(id, buildHypotheses(lo, hi));
+    history.set(id, []);
+  }
+  for (const b of brief.ratings?.best ?? []) bestByReq.set(b.id, b.rating_milli);
   const manifest = brief.workload?.manifest ?? [];
-  const order = manifest.map((row, index) => ({ row, index })).sort((a, b) => {
-    const wa = typeof a.row.weight === 'number' ? a.row.weight : 1;
-    const wb = typeof b.row.weight === 'number' ? b.row.weight : 1;
-    if (wa !== wb) return wb - wa;
-    return a.index - b.index;
-  });
-  for (const { row } of order) {
-    const candidates = candidatesFor(routes, row.requires, row.api === 'openai' && rowRequiresJsonWire(row.requires));
-    const pick = candidates.find((route) => (planUsage.get(route.provider.id) ?? 0) < route.budget) ?? null;
-    if (pick === null) continue;
-    plan.set(row.id, pick);
-    planUsage.set(pick.provider.id, (planUsage.get(pick.provider.id) ?? 0) + 1);
+  totalBound = 0;
+  for (const row of manifest) {
+    const top = bestByReq.get(row.id) ?? 0;
+    totalBound += row.weight * top;
+  }
+  targetEarned = totalBound > 0 ? Math.ceil(0.98 * totalBound) + 60 : 0;
+  remSafe = new Array<number>(manifest.length + 1).fill(0);
+  for (let i = manifest.length - 1; i >= 0; i--) {
+    const r = manifest[i]!;
+    const safeRating = r.requires.vision === true ? 1432 : r.requires.min_context !== undefined ? 1440 : r.requires.json === true ? 1434 : 1390;
+    remSafe[i] = (remSafe[i + 1] ?? 0) + r.weight * safeRating;
   }
 }
 
-/** Whether a manifest row's JSON requirement, on the OpenAI wire, rules the Messages upstream wire out. */
-function rowRequiresJsonWire(requires: Requirement): boolean {
-  return requires.json === true;
+function nextFailProb(providerId: string, hist: readonly Outcome[], outageElsewhere: boolean, secPrior: number): number {
+  const histKey = hist.join(',');
+  const key = `${providerId}|${histKey}|${outageElsewhere ? 1 : 0}|${secPrior.toFixed(3)}`;
+  const cached = probMemo.get(key);
+  if (cached !== undefined) return cached;
+  let hyps = hypothesesByProvider.get(providerId);
+  if (hyps === undefined) {
+    const [lo, hi] = CALL_BOUNDS[providerId] ?? DEFAULT_BOUNDS;
+    hyps = buildHypotheses(lo, hi);
+    hypothesesByProvider.set(providerId, hyps);
+  }
+  const outPrior = outageElsewhere ? 0 : 1 / activeProviderCount;
+  const nextK = hist.length + 1;
+  let wT = 0;
+  let wF = 0;
+  for (const h of hyps) {
+    const pOut = h.outage === null ? 1 - outPrior : outPrior;
+    if (pOut <= 0) continue;
+    const w = h.baseW * pOut * (h.isSec ? secPrior : 1 - secPrior);
+    let ok = true;
+    for (let i = 0; i < hist.length; i++) {
+      const k = i + 1;
+      const ev: Outcome = k > h.budget ? 'spent' : h.outage !== null && k >= h.outage ? 'out' : h.fails.has(k) ? 'tr' : 'ok';
+      if (ev !== hist[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    wT += w;
+    if (nextK > h.budget || (h.outage !== null && nextK >= h.outage) || h.fails.has(nextK)) wF += w;
+  }
+  const res = wT === 0 ? 1 : wF / wT;
+  probMemo.set(key, res);
+  return res;
 }
 
-/** The runtime's per-provider state: the calls it has taken, its consecutive refusals, and whether it is set aside. */
-const used = new Map<string, number>();
-const consecutiveRefusals = new Map<string, number>();
-const setAside = new Set<string>();
+/** Best eligible route per live provider, ordered by Bayesian expected-call + quality-reserve cost. */
+function pickNextRoute(routes: readonly Route[], requires: Requirement, needsJsonWire: boolean, reqIndex: number, reqWeight: number): Route | null {
+  const byProvider = new Map<string, Route>();
+  for (const route of routes) {
+    if (setAside.has(route.provider.id)) continue;
+    if (!carriesJsonMode(route.wire) && needsJsonWire) continue;
+    if (!meetsRequirements(requires, capabilitiesOf(route.model, route.row))) continue;
+    const prev = byProvider.get(route.provider.id);
+    if (prev === undefined || route.rating > prev.rating || (route.rating === prev.rating && route.model.id < prev.model.id)) {
+      byProvider.set(route.provider.id, route);
+    }
+  }
+  if (byProvider.size === 0) return null;
+  const manifest = brief.workload?.manifest ?? [];
+  let futTV = 0;
+  let futV = 0;
+  for (let j = reqIndex + 1; j < manifest.length; j++) {
+    const r = manifest[j]!;
+    if (r.requires.vision === true) {
+      futV += 1;
+      if (r.requires.tools === true) futTV += 1;
+    }
+  }
+  const secPrior = k2FailSeen ? 0.03 : Math.min(0.5, 1 / Math.max(2, activeProviderCount - k2OkCount));
+  const safeTail = reqIndex + 1 < remSafe.length ? (remSafe[reqIndex + 1] ?? 0) : 0;
+  const scored = [...byProvider.values()].map((route) => {
+    const p = route.provider.id;
+    const hist = history.get(p) ?? [];
+    const pf = nextFailProb(p, hist, outageProvider !== null && outageProvider !== p, hist.length === 1 ? secPrior : 1 / activeProviderCount);
+    let resPen = 0;
+    if (requires.vision !== true && hist.length === 0) {
+      if ((p === 'gemini' || p === 'zai') && futTV > 0) resPen = 5;
+      else if ((p === 'gemini' || p === 'zai' || p === 'sambanova') && futV > 0) resPen = 0.5;
+    }
+    const deficit = totalBound > 0 ? Math.max(0, targetEarned - (earnedSoFar + reqWeight * route.rating + safeTail)) : 0;
+    const cost = (pf + resPen) * 600 + deficit * 5 - reqWeight * route.rating * 0.02;
+    return { route, cost };
+  });
+  scored.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    if (a.route.rating !== b.route.rating) return b.route.rating - a.route.rating;
+    if (a.route.provider.id !== b.route.provider.id) return a.route.provider.id < b.route.provider.id ? -1 : 1;
+    return a.route.model.id < b.route.model.id ? -1 : a.route.model.id > b.route.model.id ? 1 : 0;
+  });
+  return scored[0]?.route ?? null;
+}
 
 /** One client request body, or null when it is not one JSON object or is too large. */
 async function readJson(req: IncomingMessage): Promise<Json | null> {
@@ -272,15 +363,6 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
-  const manifest = brief.workload?.manifest ?? [];
-  const entry = manifest[manifestIndex];
-  manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
-}
-
 /** Requirements read off a request body, when the manifest has no row for it. */
 function requirementsFromBody(body: Json): Requirement {
   const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -322,65 +404,90 @@ function isRefusal(status: number): boolean {
 }
 
 /**
- * Serve one chat request on either client wire: route it, call the provider, fail over on refusals, and
- * render the answer back in the client's own shape. The loop is the whole failover story: a refusal
- * costs the call it took, hands the request to the next candidate, and a provider that refuses twice in
- * a row is set aside for the rest of the trial.
+ * Serve one chat request on either client wire: pick the best route by Bayesian call hazard and quality
+ * reserve, call the provider, classify refusals into transient/outage/spent, and render the answer back.
  */
 async function serveChat(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) {
-    return sendError(res, clientApi, 400, clientApi === 'anthropic' ? 'invalid_request_error' : 'invalid_request_error', 'the request body is not one JSON object');
+    return sendError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
   }
-  // The manifest is in arrival order and the client sends one request at a time: this row is this request.
   const manifest = brief.workload?.manifest ?? [];
-  const row = manifest[manifestIndex];
+  const reqIndex = manifestIndex;
+  const row = manifest[reqIndex];
   manifestIndex += 1;
   const requires = row !== undefined ? row.requires : requirementsFromBody(body);
+  const reqWeight = row !== undefined ? row.weight : 1;
+  const bestCap = row !== undefined ? (bestByReq.get(row.id) ?? 2000) : 2000;
   // JSON mode on the Chat Completions wire can only ride an upstream wire that carries it.
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   const needsJsonWire = clientApi === 'openai' && (format === 'json_object' || format === 'json_schema' || requires.json === true);
   const routes = allRoutes();
-  const candidates = candidatesFor(routes, requires, needsJsonWire);
-  const planned = row !== undefined ? plan.get(row.id) : undefined;
-  let ordered: Route[] = candidates;
-  if (planned !== undefined && candidates.includes(planned)) {
-    ordered = [planned, ...candidates.filter((route) => route !== planned)];
-  }
 
   let answer: NormalAnswer | null = null;
   let servedOn: Route | null = null;
-  for (const route of ordered) {
-    if (setAside.has(route.provider.id)) continue;
-    if ((used.get(route.provider.id) ?? 0) >= route.budget) continue;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const route = pickNextRoute(routes, requires, needsJsonWire, reqIndex, reqWeight);
+    if (route === null) break;
+    const p = route.provider.id;
+    let hist = history.get(p);
+    if (hist === undefined) {
+      hist = [];
+      history.set(p, hist);
+    }
     let upstream: Response;
     try {
       upstream = await callProvider(route, clientApi, body);
     } catch (err) {
-      log(`call to ${route.provider.id}/${route.model.id} failed: ${(err as Error).message}`);
-      setAside.add(route.provider.id);
+      log(`call to ${p}/${route.model.id} failed: ${(err as Error).message}`);
+      setAside.add(p);
       continue;
     }
     if (upstream.status >= 200 && upstream.status < 300) {
-      used.set(route.provider.id, (used.get(route.provider.id) ?? 0) + 1);
-      consecutiveRefusals.set(route.provider.id, 0);
+      hist.push('ok');
+      if (hist.length === 2) k2OkCount += 1;
+      consecutiveRefusals.set(p, 0);
+      earnedSoFar += reqWeight * Math.min(route.rating, bestCap);
       const parsed: unknown = await upstream.json();
       answer = normalizeAnswer(route.wire, isRecord(parsed) ? parsed : {});
       servedOn = route;
       break;
     }
     const status = upstream.status;
-    await upstream.arrayBuffer().catch(() => undefined);
-    log(`${route.provider.id}/${route.model.id} answered HTTP ${status}`);
+    const errText = await upstream.text().catch(() => '');
+    log(`${p}/${route.model.id} answered HTTP ${status}`);
     if (isRefusal(status)) {
-      used.set(route.provider.id, (used.get(route.provider.id) ?? 0) + 1);
-      const consecutive = (consecutiveRefusals.get(route.provider.id) ?? 0) + 1;
-      consecutiveRefusals.set(route.provider.id, consecutive);
-      if (consecutive >= 2) setAside.add(route.provider.id);
+      let msg = errText;
+      try {
+        const j: unknown = JSON.parse(errText);
+        if (isRecord(j) && isRecord(j.error) && typeof j.error.message === 'string') msg = j.error.message;
+      } catch {
+        // Non-JSON refusal body: classify using raw text fallback.
+      }
+      let ev: Outcome;
+      if (msg.includes('budget is spent')) {
+        ev = 'spent';
+        setAside.add(p);
+      } else if (msg.endsWith(' is out')) {
+        ev = 'out';
+        setAside.add(p);
+        outageProvider = p;
+      } else {
+        const consecutive = (consecutiveRefusals.get(p) ?? 0) + 1;
+        consecutiveRefusals.set(p, consecutive);
+        if (consecutive >= 2) {
+          ev = 'spent';
+          setAside.add(p);
+        } else {
+          ev = 'tr';
+        }
+      }
+      hist.push(ev);
+      if (hist.length === 2) k2FailSeen = true;
       continue;
     }
     // A 400 or 401 is this router's own mistake with this provider: stop using it, try the next candidate.
-    setAside.add(route.provider.id);
+    setAside.add(p);
     continue;
   }
 
@@ -470,7 +577,7 @@ async function start(): Promise<void> {
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   const routes = allRoutes();
-  planWorkload(routes);
+  initRouter(routes);
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
